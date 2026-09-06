@@ -7,7 +7,7 @@
 # 注意：当前版本的可执行文件（avahi-manager serve/helper）仍以命令行参数
 # 或内置默认值运行，尚不直接解析 manager.toml。安装脚本把安装选项写入
 # systemd 的 ExecStart，并生成 manager.toml 记录实际部署值。
-# 计划中（PLAN.md §31）管理器最终会原生读取该文件。
+# 当前该文件用于记录部署值；二进制仍通过 systemd 参数接收这些设置。
 
 # 安装使用的服务账户（Web 以非 root 身份运行，Helper 以 root 运行）。
 user = "avahi-manager"

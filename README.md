@@ -1,91 +1,73 @@
 # Avahi Manager
 
-根据 [PLAN.md](PLAN.md) 开发的 Linux 原生 Avahi 管理平台。已有内嵌 React 八页界面、Go REST API、认证、配置/服务/主机管理、实时发现、日志、特权 Helper 和 systemd 安装脚本。项目仍在实现中，APT 更新、完整目录备份和 Debian 打包尚未完成。
+Avahi Manager 是面向 Linux 的本地 Web 管理界面，用于查看和管理 Avahi、mDNS/DNS-SD 服务、主机映射、网络接口、日志与配置快照。
 
-Avahi 继续负责 mDNS/DNS-SD。`/etc/avahi` 是配置事实来源，SQLite 仅保存管理员、会话、审计、任务、快照索引与管理状态。最终交付为内嵌 React 的单个 Go 程序，分别运行非 root `serve` 和 root `helper` 模式。
+项目使用内嵌 React 前端的单个 Go 二进制。Web 服务以非 root 账户运行，需要特权的配置写入和 systemd 操作通过独立 root Helper 完成。
 
-## 当前可运行内容
+> 当前为开发版本。建议先在可恢复的 Debian/Ubuntu 测试机上验证，不要直接用于生产网络。
 
-完整启动流程和注意事项见 **[使用指南](docs/USAGE.md)**，包括一键安装、首次登录、账户与目录权限、备份恢复和 socket 报错排查。
+## 主要功能
 
-前端默认使用简体中文，八个页面均提供中文操作提示；配置键名、协议标识、原始日志和错误诊断保留原文，便于排查。页面内补充了保存重启、接口白名单、反射器风险及快照范围等说明。更新前端后需运行 `make build` 重新生成内嵌资源的二进制，再重启 Web 进程并刷新浏览器；已有账户无需重新初始化。
+- Avahi 状态、网络接口和实时服务发现
+- `avahi-daemon.conf`、`hosts` 和静态 `.service` 管理
+- Start、Stop、Restart、Reload、Enable、Disable
+- 配置版本冲突检测、快照、失败回滚与审计日志
+- 单管理员认证、CSRF/Origin/Host 校验和登录限流
+- 非 root Web、root Helper 和 Unix socket 权限隔离
 
-构建需要 Linux、Go 1.26+、Node.js 24 和 npm；运行生成的二进制不需要 Node.js。隔离 D-Bus 集成测试需要 `dbus-daemon`。以下诊断命令不修改宿主机配置。
+## 快速安装
+
+目标机需要 systemd、D-Bus、`avahi-daemon` 和 `avahi-daemon.socket`。
+
+从 GitHub Release 下载 Linux AMD64 压缩包后：
 
 ```bash
-make check
-./bin/avahi-manager detect
-./bin/avahi-manager interfaces
-./bin/avahi-manager discover --duration 10s
+tar -xzf avahi-manager-<version>-linux-amd64.tar.gz
+cd avahi-manager-<version>-linux-amd64
+./install.sh
 ```
 
-生成安装包并部署到使用 systemd 的 Linux 主机：
+安装脚本会自动调用 `sudo`、创建服务账户和目录、初始化网页登录管理员、安装 systemd 单元并启动服务。默认访问地址为 `http://127.0.0.1:8053`。
+
+常用命令：
 
 ```bash
-make dist
-cd dist                       # install.sh 与 avahi-manager 位于同一目录
-./install.sh                  # 自动调用 sudo、创建账户、初始化管理员并启动
 ./install.sh status
+./install.sh start
+./install.sh stop
 ./install.sh restart
 ./install.sh logs
-./install.sh uninstall        # 保留数据库和备份
+./install.sh uninstall
 ./install.sh uninstall --purge
 ```
 
-目标机需预先安装并配置 `avahi-daemon`；脚本不会自动执行包管理器。重复执行安装命令会原地更新二进制和 systemd 单元，并保留管理员与业务数据。
+完整选项、更新方式、远程访问和故障排查见[使用指南](docs/USAGE.md)。
 
-推送 `v*` 标签会自动运行 GitHub Release 工作流，例如：
+## 从源码构建
+
+构建环境需要 Linux、Go 1.26+、Node.js 24、npm 和 GNU Make：
+
+```bash
+make check
+make dist
+```
+
+`make dist` 生成 `dist/avahi-manager` 和 `dist/install.sh`。运行时不需要 Node.js 或独立 Web 服务器。
+
+## 发布
+
+推送 `v*` 标签会自动创建只包含 Linux AMD64 构建的 GitHub Release：
 
 ```bash
 git tag v0.1.0
 git push origin v0.1.0
 ```
 
-Release 只构建 Linux AMD64，提供包含 `avahi-manager` 和 `install.sh` 的 `tar.gz`，以及对应的 SHA-256 校验文件。带连字符的版本标签（例如 `v0.2.0-rc.1`）会发布为 prerelease。
+具体规则见[发布指南](docs/RELEASE.md)。
 
-真实浏览器测试使用临时 Avahi 配置、SQLite、Unix Helper 和模拟系统控制器，不修改宿主机：
+## 文档
 
-```bash
-cd frontend
-npx playwright install chromium
-cd ..
-make e2e
-```
-
-仅预览 Web 界面（普通用户执行，不启动 Helper）：
-
-```bash
-mkdir -p .dev
-./bin/avahi-manager init-admin --database "$PWD/.dev/manager.db"
-./bin/avahi-manager serve --database "$PWD/.dev/manager.db"
-```
-
-打开 `http://127.0.0.1:8053`，默认用户名 `admin`，密码为初始化时输入的密码，无默认密码。已有管理员时跳过初始化。未启动 Helper 时，配置和快照等页面出现 `helper.sock: no such file or directory` 表示依赖缺失，不是完整可用状态。连接真实 Avahi 请按[使用指南](docs/USAGE.md)安装 systemd 服务。
-
-默认监听 `127.0.0.1:8053`，除登录入口外的 API 都要求登录。安装时用 `--listen` 和 `--origins` 设置访问地址及允许的准确 Origin（包含协议和端口）。安装脚本自动配置非 root Web 账户、root Helper、受限目录、日志读取组（系统存在时）、socket activation 和 systemd 加固。
-
-`detect` 检查 OS、二进制、systemd service/socket、Avahi D-Bus 和原生配置，输出 JSON。D-Bus 查询使用 NoAutoStart，查看停止的服务不会触发启动。`interfaces` 使用 Netlink；`discover` 使用 Avahi D-Bus 信号与 ResolveService，在指定时长后输出发现快照（添加 `--events` 可输出全部缓存变化），不调用 `avahi-browse`。
-
-## 已有模块
-
-- `internal/config`：INI / hosts / 多服务 XML 模型及校验；SHA256 版本冲突检测；临时文件 fsync、原子 rename、快照、健康检查失败回滚、崩溃恢复记录、保留 20 个快照；fsnotify 目录监听。
-- `internal/systemd`：严格限定 Avahi service/socket 的 Start / Stop / Restart / Reload / Enable / Disable，等待 systemd job 完成。
-- `internal/avahi`：状态、服务解析、主机解析、实时发现、断线重连、内存缓存与订阅。
-- `internal/network` / `internal/detect`：Netlink 接口与地址读取、安装及运行状态分类。
-- `internal/database`：SQLite WAL、迁移、设置、管理文件哈希、漂移记录、审计和任务。
-- `internal/auth` / `internal/api`：单管理员、Argon2id、哈希会话、12 小时过期、注销、登录限流、HttpOnly / SameSite=Strict Cookie、HTTPS Secure Cookie、Origin/Host 校验、CSRF、修改前后持久审计及 SSE 会话复查。
-- `internal/helper`：Unix socket RPC、双向 SO_PEERCRED 校验、严格业务请求、配置/服务/快照/生命周期操作，以及启动时恢复未完成事务。同一程序已加入 root `helper` 入口，支持 systemd socket activation。
-- `internal/journal`：固定 journalctl argv、级别/字面搜索/时间范围、受限读取和实时 Follow。
-- `frontend`：React + TypeScript + Vite；Dashboard、Discovery、Services、Hosts、Interfaces、Settings、Logs、Maintenance；结构化表单、实时事件、备份与审计，桌面与移动布局。构建资源通过 go:embed 打包。
-
-最近接受的配置有独立的受保护 baseline 快照。普通备份不会改变 baseline；Manager 重启后外部修改仍被标记为漂移。保存成功、显式 Reload from disk 或 Restore 才会更新接受的版本。恢复中断事务时同时恢复文件和 baseline 指针。
-
-测试只在临时目录和独立 D-Bus 总线上执行修改与故障注入；不对本机 Avahi 执行写入、重启或 APT 操作。
-
-## 尚未交付
-
-完整剩余工作、已验证证据和验收清单见 [DEVELOPMENT.md](DEVELOPMENT.md)。APT 安装/更新、完整 `/etc/avahi/*` 辅助文件归档、Debian 包及真实发行版上的完整生产验收仍待实现。
-
-## 依据
-
-配置格式以 Avahi 的官方说明为依据：[daemon 配置](https://github.com/avahi/avahi/blob/master/man/avahi-daemon.conf.5.xml.in)、[静态服务 XML](https://github.com/avahi/avahi/blob/master/man/avahi.service.5.xml.in)、[hosts](https://github.com/avahi/avahi/blob/master/man/avahi.hosts.5.xml.in)。D-Bus 参数签名对照宿主机包提供的 `/usr/share/dbus-1/interfaces/org.freedesktop.Avahi.*.xml`，并通过私有 D-Bus 集成测试验证。
+- [使用、安装与排障](docs/USAGE.md)
+- [架构与安全边界](docs/ARCHITECTURE.md)
+- [开发与验收状态](DEVELOPMENT.md)
+- [标签与 Release](docs/RELEASE.md)
