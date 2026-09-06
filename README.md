@@ -34,6 +34,15 @@ cd dist                       # install.sh 与 avahi-manager 位于同一目录
 
 目标机需预先安装并配置 `avahi-daemon`；脚本不会自动执行包管理器。重复执行安装命令会原地更新二进制和 systemd 单元，并保留管理员与业务数据。
 
+推送 `v*` 标签会自动运行 GitHub Release 工作流，例如：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Release 只构建 Linux AMD64，提供包含 `avahi-manager` 和 `install.sh` 的 `tar.gz`，以及对应的 SHA-256 校验文件。带连字符的版本标签（例如 `v0.2.0-rc.1`）会发布为 prerelease。
+
 真实浏览器测试使用临时 Avahi 配置、SQLite、Unix Helper 和模拟系统控制器，不修改宿主机：
 
 ```bash

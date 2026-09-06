@@ -1,0 +1,108 @@
+name: Release Linux AMD64
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Verify Linux AMD64 runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = "Linux"
+          test "$(uname -m)" = "x86_64"
+
+      - name: Test source and installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n packaging/install.sh
+          make check
+
+      - name: Build Linux AMD64 release archive
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+          safe_tag="$(printf '%s' "$tag" | sed 's/[^0-9A-Za-z._-]/-/g')"
+          version="${safe_tag#v}"
+          test -n "$version"
+          package_name="avahi-manager-${version}-linux-amd64"
+          staging_dir="${RUNNER_TEMP}/${package_name}"
+          archive="${GITHUB_WORKSPACE}/${package_name}.tar.gz"
+          checksum="${archive}.sha256"
+
+          mkdir -p "$staging_dir"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags="-s -w" \
+            -o "$staging_dir/avahi-manager" ./cmd/avahi-manager
+          install -m 0755 packaging/install.sh "$staging_dir/install.sh"
+
+          tar -C "$RUNNER_TEMP" -czf "$archive" "$package_name"
+          cd "$GITHUB_WORKSPACE"
+          sha256sum "$(basename "$archive")" >"$(basename "$checksum")"
+
+          echo "archive=$archive" >>"$GITHUB_OUTPUT"
+          echo "checksum=$checksum" >>"$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          CHECKSUM: ${{ steps.package.outputs.checksum }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$ARCHIVE" "$CHECKSUM" --clobber
+            exit 0
+          fi
+
+          release_flags=()
+          if [[ "$tag" == *-* ]]; then
+            release_flags+=(--prerelease)
+          fi
+
+          gh release create "$tag" "$ARCHIVE" "$CHECKSUM" \
+            --verify-tag \
+            --generate-notes \
+            --title "Avahi Manager $tag" \
+            "${release_flags[@]}"
