@@ -1,0 +1,24 @@
+[Unit]
+Description=Avahi Manager privileged helper socket
+Documentation=https://github.com/anomalyco/opencode/issues
+PartOf=avahi-manager.service
+Before=avahi-manager.service
+
+[Socket]
+# systemd creates the /run/avahi-manager runtime directory here and owns it by
+# the manager account, so the non-root web process can traverse it to reach the
+# socket. Declared only here (not in the services) to avoid a chown tug-of-war.
+RuntimeDirectory=avahi-manager
+RuntimeDirectoryMode=0750
+User=avahi-manager
+Group=avahi-manager
+
+# Socket is group-accessible so the non-root web account can open it, while
+# final peer-credential (UID) enforcement happens in the helper process.
+ListenStream=@@SOCKET_PATH@@
+SocketUser=avahi-manager
+SocketGroup=avahi-manager
+SocketMode=0660
+
+[Install]
+WantedBy=sockets.target

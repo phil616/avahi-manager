@@ -1,0 +1,11 @@
+.codegraph/
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+frontend/test-results/
+frontend/playwright-report/
+bin/
+coverage.out
+*.db
+*.db-shm
+*.db-wal

@@ -1,0 +1,40 @@
+[Unit]
+Description=Avahi Manager web interface
+Documentation=https://github.com/anomalyco/opencode/issues
+After=network.target avahi-manager-helper.socket
+Wants=avahi-manager-helper.socket
+
+[Service]
+Type=exec
+User=@@USER@@
+Group=@@USER@@
+
+# Non-root HTTP server. It never writes to /etc/avahi; privileged operations go
+# through the root helper over the Unix socket.
+ExecStart=@@BINARY_PATH@@ serve \
+    --database @@DATABASE_PATH@@ \
+    --config-dir @@AVAHI_CONFIG_DIR@@ \
+    --helper @@SOCKET_PATH@@ \
+    --origins @@ORIGINS@@ \
+    --listen @@LISTEN@@
+
+# SQLite database and session storage owned by the non-root web account.
+StateDirectory=avahi-manager
+StateDirectoryMode=0700
+
+Restart=on-failure
+RestartSec=5s
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=@@DATABASE_DIR@@ /run/avahi-manager
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

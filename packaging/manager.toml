@@ -1,0 +1,38 @@
+# Avahi Manager 部署配置
+#
+# 本文件由 packaging/install.sh 读取，作为 systemd 单元和安装过程的单一事实来源。
+# 目标位置：/etc/avahi-manager/manager.toml
+#
+# 注意：当前版本的可执行文件（avahi-manager serve/helper）仍以命令行参数
+# 或内置默认值运行，尚不直接解析 manager.toml。install.sh 会把这里的值
+# 注入生成的 systemd 单元文件（ExecStart 参数），从而在部署层面生效。
+# 计划中（PLAN.md §31）管理器最终会原生读取该文件。
+
+# 安装使用的服务账户（Web 以非 root 身份运行，Helper 以 root 运行）。
+user = "avahi-manager"
+
+# 二进制安装路径。
+binary_path = "/usr/local/libexec/avahi-manager"
+
+# 可选：预编译产物下载地址。当本机没有 bin/avahi-manager 且未用 -b 指定时，
+# install.sh 会尝试从该 URL 下载单个二进制（需有 curl/wget）。
+# 留空则要求本地已有二进制（先执行 make build）。
+binary_url = ""
+
+# Avahi 原生配置目录（配置事实来源）。
+avahi_config_dir = "/etc/avahi"
+
+# Web 进程 SQLite 数据库路径（非 root 账户所有）。
+database_path = "/var/lib/avahi-manager/manager.db"
+
+# root Helper 的备份/快照目录（root 所有，Web 账户不可写）。
+backups_dir = "/var/lib/avahi-manager-helper/backups"
+
+# Helper Unix socket 监听路径。
+socket_path = "/run/avahi-manager/helper.sock"
+
+# Web HTTP 监听地址。
+listen = "127.0.0.1:8053"
+
+# 允许的浏览器 Origin（精确匹配，多个用逗号分隔）。
+origins = ["http://127.0.0.1:8053"]
