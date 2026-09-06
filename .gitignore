@@ -5,6 +5,7 @@ frontend/dist/
 frontend/test-results/
 frontend/playwright-report/
 bin/
+dist/
 coverage.out
 *.db
 *.db-shm

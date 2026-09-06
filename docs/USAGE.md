@@ -1,6 +1,6 @@
 # Avahi Manager 使用指南
 
-本文档对应当前开发版本，介绍从构建到部署到启动的完整手动流程，不代表 PLAN.md 全部完成。APT 安装/更新、manager.toml、systemd 部署文件、Debian 包和完整目录备份尚未交付。建议先在可恢复的测试机联调，不要直接用于生产网络。
+本文档对应当前开发版本，介绍从构建、systemd 安装到日常管理的完整流程，不代表 PLAN.md 全部完成。APT 安装/更新、Debian 包和完整目录备份尚未交付。建议先在可恢复的测试机联调，不要直接用于生产网络。
 
 ---
 
@@ -198,9 +198,47 @@ http://127.0.0.1:8053
 
 ---
 
-## 5. 连接真实 Avahi：手动部署
+## 5. 连接真实 Avahi：自动部署
 
-以下步骤会创建系统账户和目录、安装本项目二进制。后续网页保存、恢复和服务控制会真正修改 `/etc/avahi`、重载或重启 Avahi。
+以下步骤会创建系统账户和目录、安装本项目二进制及 systemd 单元。后续网页保存、恢复和服务控制会真正修改 `/etc/avahi`、重载或重启 Avahi。
+
+先在仓库根目录构建两文件发布目录：
+
+```bash
+make dist
+cd dist
+ls -l avahi-manager install.sh
+```
+
+将 `dist/` 复制到目标 Linux 主机后执行：
+
+```bash
+./install.sh
+```
+
+脚本会按需调用 `sudo`，然后自动完成服务账户、数据库/备份/socket 目录权限、tmpfiles、systemd 单元、首次网页登录管理员初始化和服务启动。管理员密码交互输入且不会写入命令行。已有安装可直接重复运行此命令进行原地更新，已有管理员和数据会保留。
+
+常用管理命令：
+
+```bash
+./install.sh status
+./install.sh start|stop|restart
+./install.sh logs
+./install.sh uninstall           # 保留数据库、备份及服务账户
+./install.sh uninstall --purge   # 同时删除数据及脚本创建的账户
+```
+
+监听地址、Origin 或账户需要定制时，在首次安装时传入选项：
+
+```bash
+./install.sh --user avahi-manager \
+  --listen 127.0.0.1:8053 \
+  --origins http://127.0.0.1:8053,http://localhost:8053
+```
+
+`./install.sh --help` 会列出完整选项。脚本只接受同目录中名为 `avahi-manager` 的产物，不从网络下载程序，也不会自动安装 Avahi 软件包。
+
+以下 5.1–5.8 节保留底层布局和手动排障说明；正常部署不需要逐条执行。
 
 ### 5.0 前提确认
 
@@ -210,7 +248,7 @@ http://127.0.0.1:8053
 - 有 root 权限
 - 用 `detect` 检查过目标机器状态
 
-### 5.1 备份现有 Avahi 配置
+### 5.1 手动备份现有 Avahi 配置（建议）
 
 部署前先独立备份整个 `/etc/avahi`：
 
@@ -452,23 +490,22 @@ sudo usermod -aG systemd-journal avahi-manager
 
 ### 8.1 停止
 
-先在 Web 终端 Ctrl+C，再停止 Helper。如正在应用配置，应等待完成或恢复，避免强制杀进程。停止 Manager 不会停止 Avahi，已写入的原生配置仍保留。
+systemd 部署使用 `sudo systemctl stop avahi-manager.service`。如正在应用配置，应等待完成或恢复，避免强制杀进程。停止 Manager 不会停止 Avahi，已写入的原生配置仍保留。
 
 ### 8.2 重启
 
-再次启动跳过初始化，先 Helper 后 Web，沿用原数据库、备份和配置路径。`/run` 通常在重启后清空，需重新创建运行目录：
+再次启动会沿用原数据库、备份和配置路径；socket 及其运行目录由 tmpfiles 和 systemd 自动重建：
 
 ```bash
-sudo install -d -o root -g avahi-manager -m 0750 /run/avahi-manager
+sudo systemctl restart avahi-manager.service
 ```
 
 ### 8.3 更新项目
 
 1. 构建并测试新版本：`make check`
-2. 停止两个进程（先 Web 后 Helper）
-3. 替换安装二进制：`sudo install -o root -g root -m 0755 ./bin/avahi-manager /usr/local/libexec/avahi-manager`
-4. 按顺序启动（先 Helper 后 Web）
-5. 刷新浏览器
+2. 生成发布目录：`make dist`
+3. 在 `dist/` 中再次执行 `./install.sh`
+4. 用 `./install.sh status` 检查状态并刷新浏览器
 
 已有账户无需重新初始化。
 
@@ -565,9 +602,9 @@ sudo -u avahi-manager /usr/local/libexec/avahi-manager serve \
 
 ---
 
-## 11. 一键启动脚本示例
+## 11. 手动启动脚本示例（仅排障）
 
-以下是手动部署时的快速启动参考脚本：
+以下是绕过 systemd 排障时的启动参考；正常使用应由 `install.sh` 管理：
 
 ```bash
 #!/bin/bash
@@ -632,11 +669,9 @@ make e2e
 
 以下功能在 PLAN.md 中规划但尚未实现，当前部署不包含：
 
-- `manager.toml` 配置文件（位于 `/etc/avahi-manager/manager.toml`）
-- systemd service/helper/socket 单元文件
 - Debian 包和 APT 安装入口
 - 完整 `/etc/avahi/*` 辅助文件归档
-- 生产权限硬化与完整目录备份
+- 真实发行版权限验收与完整目录备份
 - 密码重置命令
 
 未交付事项及验证记录见 [DEVELOPMENT.md](../DEVELOPMENT.md)，原始要求见 [PLAN.md](../PLAN.md)。

@@ -1,12 +1,12 @@
 # Avahi Manager
 
-根据 [PLAN.md](PLAN.md) 开发的 Linux 原生 Avahi 管理平台。已有内嵌 React 八页界面、Go REST API、认证、配置/服务/主机管理、实时发现、日志和特权 Helper。项目仍在实现中，APT 更新、完整目录备份和生产打包尚未完成。
+根据 [PLAN.md](PLAN.md) 开发的 Linux 原生 Avahi 管理平台。已有内嵌 React 八页界面、Go REST API、认证、配置/服务/主机管理、实时发现、日志、特权 Helper 和 systemd 安装脚本。项目仍在实现中，APT 更新、完整目录备份和 Debian 打包尚未完成。
 
 Avahi 继续负责 mDNS/DNS-SD。`/etc/avahi` 是配置事实来源，SQLite 仅保存管理员、会话、审计、任务、快照索引与管理状态。最终交付为内嵌 React 的单个 Go 程序，分别运行非 root `serve` 和 root `helper` 模式。
 
 ## 当前可运行内容
 
-完整启动流程和注意事项见 **[使用指南](docs/USAGE.md)**，包括首次登录、Helper 启动、账户与目录权限、备份恢复和 socket 报错排查。
+完整启动流程和注意事项见 **[使用指南](docs/USAGE.md)**，包括一键安装、首次登录、账户与目录权限、备份恢复和 socket 报错排查。
 
 前端默认使用简体中文，八个页面均提供中文操作提示；配置键名、协议标识、原始日志和错误诊断保留原文，便于排查。页面内补充了保存重启、接口白名单、反射器风险及快照范围等说明。更新前端后需运行 `make build` 重新生成内嵌资源的二进制，再重启 Web 进程并刷新浏览器；已有账户无需重新初始化。
 
@@ -18,6 +18,21 @@ make check
 ./bin/avahi-manager interfaces
 ./bin/avahi-manager discover --duration 10s
 ```
+
+生成安装包并部署到使用 systemd 的 Linux 主机：
+
+```bash
+make dist
+cd dist                       # install.sh 与 avahi-manager 位于同一目录
+./install.sh                  # 自动调用 sudo、创建账户、初始化管理员并启动
+./install.sh status
+./install.sh restart
+./install.sh logs
+./install.sh uninstall        # 保留数据库和备份
+./install.sh uninstall --purge
+```
+
+目标机需预先安装并配置 `avahi-daemon`；脚本不会自动执行包管理器。重复执行安装命令会原地更新二进制和 systemd 单元，并保留管理员与业务数据。
 
 真实浏览器测试使用临时 Avahi 配置、SQLite、Unix Helper 和模拟系统控制器，不修改宿主机：
 
@@ -36,9 +51,9 @@ mkdir -p .dev
 ./bin/avahi-manager serve --database "$PWD/.dev/manager.db"
 ```
 
-打开 `http://127.0.0.1:8053`，默认用户名 `admin`，密码为初始化时输入的密码，无默认密码。已有管理员时跳过初始化。未启动 Helper 时，配置和快照等页面出现 `helper.sock: no such file or directory` 表示依赖缺失，不是完整可用状态。连接真实 Avahi 请按[使用指南](docs/USAGE.md)启动两个进程。
+打开 `http://127.0.0.1:8053`，默认用户名 `admin`，密码为初始化时输入的密码，无默认密码。已有管理员时跳过初始化。未启动 Helper 时，配置和快照等页面出现 `helper.sock: no such file or directory` 表示依赖缺失，不是完整可用状态。连接真实 Avahi 请按[使用指南](docs/USAGE.md)安装 systemd 服务。
 
-默认监听 `127.0.0.1:8053`，除登录入口外的 API 都要求登录。`serve --origins` 设置允许的准确 Origin（包含协议和端口）；修改访问地址时需同步配置 Origin。账户、日志权限和安全目录的自动部署仍待打包阶段交付，当前不是生产就绪版本。
+默认监听 `127.0.0.1:8053`，除登录入口外的 API 都要求登录。安装时用 `--listen` 和 `--origins` 设置访问地址及允许的准确 Origin（包含协议和端口）。安装脚本自动配置非 root Web 账户、root Helper、受限目录、日志读取组（系统存在时）、socket activation 和 systemd 加固。
 
 `detect` 检查 OS、二进制、systemd service/socket、Avahi D-Bus 和原生配置，输出 JSON。D-Bus 查询使用 NoAutoStart，查看停止的服务不会触发启动。`interfaces` 使用 Netlink；`discover` 使用 Avahi D-Bus 信号与 ResolveService，在指定时长后输出发现快照（添加 `--events` 可输出全部缓存变化），不调用 `avahi-browse`。
 
@@ -50,7 +65,7 @@ mkdir -p .dev
 - `internal/network` / `internal/detect`：Netlink 接口与地址读取、安装及运行状态分类。
 - `internal/database`：SQLite WAL、迁移、设置、管理文件哈希、漂移记录、审计和任务。
 - `internal/auth` / `internal/api`：单管理员、Argon2id、哈希会话、12 小时过期、注销、登录限流、HttpOnly / SameSite=Strict Cookie、HTTPS Secure Cookie、Origin/Host 校验、CSRF、修改前后持久审计及 SSE 会话复查。
-- `internal/helper`：Unix socket RPC、双向 SO_PEERCRED 校验、严格业务请求、配置/服务/快照/生命周期操作，以及启动时恢复未完成事务。同一程序已加入 root `helper` 入口，支持 systemd socket activation；部署目录与账户仍需后续打包阶段配置。
+- `internal/helper`：Unix socket RPC、双向 SO_PEERCRED 校验、严格业务请求、配置/服务/快照/生命周期操作，以及启动时恢复未完成事务。同一程序已加入 root `helper` 入口，支持 systemd socket activation。
 - `internal/journal`：固定 journalctl argv、级别/字面搜索/时间范围、受限读取和实时 Follow。
 - `frontend`：React + TypeScript + Vite；Dashboard、Discovery、Services、Hosts、Interfaces、Settings、Logs、Maintenance；结构化表单、实时事件、备份与审计，桌面与移动布局。构建资源通过 go:embed 打包。
 
@@ -60,7 +75,7 @@ mkdir -p .dev
 
 ## 尚未交付
 
-完整剩余工作、已验证证据和验收清单见 [DEVELOPMENT.md](DEVELOPMENT.md)。APT 安装/更新、完整 `/etc/avahi/*` 辅助文件归档、manager.toml、systemd/Debian 包及完整生产权限验证仍待实现；当前不是已完成生产验收的发布版本。
+完整剩余工作、已验证证据和验收清单见 [DEVELOPMENT.md](DEVELOPMENT.md)。APT 安装/更新、完整 `/etc/avahi/*` 辅助文件归档、Debian 包及真实发行版上的完整生产验收仍待实现。
 
 ## 依据
 

@@ -1,244 +1,442 @@
 #!/usr/bin/env bash
-#
-# Avahi Manager 一键安装脚本
-#
-# 在全新 Linux systemd 机器上：下载/使用单个 Go 二进制 -> 创建账户与目录 ->
-# 生成 systemd 单元 -> enable --now 启动 -> 引导管理员密码。
-#
-# 用法：
-#   sudo ./packaging/install.sh                # 使用 /etc/avahi-manager/manager.toml
-#   sudo ./packaging/install.sh -c 路径.toml   # 指定配置
-#   sudo ./packaging/install.sh -b ./bin/avahi-manager   # 指定二进制（跳过下载）
-#   ./packaging/install.sh -u                  # 卸载（需 sudo）
-#
-# 配置事实来源：manager.toml（默认 packaging/manager.toml，安装后复制到
-# /etc/avahi-manager/manager.toml）。systemd 单元由本脚本根据该文件生成。
-# 注意：当前二进制仍以命令行参数运行，尚不原生解析 manager.toml。
+# Install, inspect, or remove Avahi Manager on a systemd host.
+# The distribution directory must contain this script and avahi-manager.
 
-set -euo pipefail
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 022
 
-# ---- 解析 argparse ---------------------------------------------------------
-CONFIG_FILE=""
-BIN_PATH_ARG=""
-UNINSTALL=0
+PROGRAM="avahi-manager"
+SERVICE="avahi-manager.service"
+HELPER_SERVICE="avahi-manager-helper.service"
+HELPER_SOCKET="avahi-manager-helper.socket"
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+SCRIPT_PATH="$SCRIPT_DIR/$(basename -- "${BASH_SOURCE[0]}")"
+SOURCE_BINARY="$SCRIPT_DIR/$PROGRAM"
+
+BINARY_PATH="/usr/local/libexec/avahi-manager"
+CONFIG_DIR="/etc/avahi-manager"
+CONFIG_FILE="$CONFIG_DIR/manager.toml"
+SYSTEMD_DIR="/etc/systemd/system"
+TMPFILES_FILE="/etc/tmpfiles.d/avahi-manager.conf"
+DATABASE_DIR="/var/lib/avahi-manager"
+DATABASE_PATH="$DATABASE_DIR/manager.db"
+BACKUP_ROOT="/var/lib/avahi-manager-helper"
+BACKUPS_DIR="$BACKUP_ROOT/backups"
+INSTALL_STATE="$BACKUP_ROOT/install-state"
+RUNTIME_DIR="/run/avahi-manager"
+SOCKET_PATH="$RUNTIME_DIR/helper.sock"
+
+ACTION="install"
+SERVICE_USER=""
+SERVICE_USER_EXPLICIT=0
+ADMIN_USER="admin"
+LISTEN="127.0.0.1:8053"
+ORIGINS="http://127.0.0.1:8053,http://localhost:8053"
+AVAHI_CONFIG_DIR="/etc/avahi"
+PURGE=0
+
+say() { printf '%s\n' "$*"; }
+die() { printf '错误: %s\n' "$*" >&2; exit 1; }
+
 usage() {
-    sed -n '2,14p' "$0"
+    cat <<'EOF'
+Avahi Manager 安装与管理脚本
+
+用法：
+  ./install.sh [install] [选项]   安装或原地更新并启动服务（默认）
+  ./install.sh status             查看安装及 systemd 状态
+  ./install.sh start|stop|restart 管理 systemd 服务
+  ./install.sh logs               持续查看 Web 与 Helper 日志
+  ./install.sh uninstall          卸载程序，保留数据库和备份
+  ./install.sh uninstall --purge  卸载并删除数据库、备份和脚本创建的账户
+
+安装选项：
+  --user NAME          服务账户（默认 avahi-manager）
+  --admin-user NAME    首次初始化的网页登录用户名（默认 admin）
+  --listen ADDRESS     HTTP 监听地址（默认 127.0.0.1:8053）
+  --origins LIST       允许的 Origin，多个用逗号分隔
+  --config-dir PATH    Avahi 配置目录（默认 /etc/avahi）
+  -h, --help           显示帮助
+
+install.sh 必须和名为 avahi-manager 的可执行文件放在同一目录。安装和卸载
+会在需要时自动通过 sudo 获取 root 权限。首次安装会交互式初始化网页登录
+管理员；密码不会出现在命令行或配置文件中。
+EOF
 }
 
-while [[ $# -gt 0 ]]; do
+need_value() {
+    [[ $# -ge 2 && -n "$2" ]] || die "$1 缺少参数值"
+}
+
+ORIGINAL_ARGS=("$@")
+while (($#)); do
     case "$1" in
-        -c|--config) CONFIG_FILE="$2"; shift 2 ;;
-        -b|--binary) BIN_PATH_ARG="$2"; shift 2 ;;
-        -u|--uninstall) UNINSTALL=1; shift ;;
+        install|status|start|stop|restart|logs|uninstall) ACTION="$1"; shift ;;
+        remove|-u|--uninstall) ACTION="uninstall"; shift ;;
+        --purge) PURGE=1; shift ;;
+        --user) need_value "$@"; SERVICE_USER="$2"; SERVICE_USER_EXPLICIT=1; shift 2 ;;
+        --admin-user) need_value "$@"; ADMIN_USER="$2"; shift 2 ;;
+        --listen) need_value "$@"; LISTEN="$2"; shift 2 ;;
+        --origins) need_value "$@"; ORIGINS="$2"; shift 2 ;;
+        --config-dir) need_value "$@"; AVAHI_CONFIG_DIR="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
-        *) echo "未知参数: $1" >&2; usage; exit 1 ;;
+        *) die "未知参数: $1（使用 --help 查看帮助）" ;;
     esac
 done
 
-# ---- 统一常量的默认值 -------------------------------------------------------
-DEFAULT_BINARY="/usr/local/libexec/avahi-manager"
-SYSTEMD_DIR="/etc/systemd/system"
-TARGET_NAME="avahi-manager"
-HELPER_NAME="avahi-manager-helper"
+[[ "$PURGE" -eq 0 || "$ACTION" == "uninstall" ]] || die "--purge 只能与 uninstall 一起使用"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PACKAGING_DIR="$(cd "$SCRIPT_DIR" && pwd)"
-UNIT_SRC="$PACKAGING_DIR/systemd"
-
-# 简单的 TOML 标量/字符串数组解析器（无需 TOML 库）。
-# 支持: key = "value"  以及  key = ["a", "b"]  -> 输出 a,b
-toml_get() {
-    local file="$1" key="$2"
-    local line
-    line="$(sed -nE "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*(.*)[[:space:]]*$/\1/p" "$file" | head -n1)"
-    [[ -z "$line" ]] && return 0
-    # 去掉首尾方括号（数组形式）
-    line="${line#\[}"; line="${line%\]}"
-    # 移除所有双引号和空白
-    line="$(printf '%s' "$line" | tr -d '"' | tr -d ' ')"
-    printf '%s' "$line"
+state_get() {
+    local key="$1"
+    [[ -r "$INSTALL_STATE" ]] || return 0
+    awk -F= -v wanted="$key" '$1 == wanted { sub(/^[^=]*=/, ""); print; exit }' "$INSTALL_STATE"
 }
 
-ensure_config() {
-    if [[ -n "$CONFIG_FILE" ]]; then
-        if [[ ! -f "$CONFIG_FILE" ]]; then
-            echo "错误: 不存在配置 $CONFIG_FILE" >&2
-            exit 1
+# Reuse the account selected by an earlier installation unless overridden.
+INSTALLED_SERVICE_USER="$(state_get SERVICE_USER)"
+if [[ -z "$SERVICE_USER" ]]; then
+    SERVICE_USER="$INSTALLED_SERVICE_USER"
+    SERVICE_USER="${SERVICE_USER:-avahi-manager}"
+fi
+
+validate_options() {
+    local port origin origin_host origin_port
+    local -a origin_items=()
+    [[ "$SERVICE_USER" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || die "服务账户名无效: $SERVICE_USER"
+    [[ "$ADMIN_USER" =~ ^[A-Za-z0-9_.@-]{1,64}$ ]] || die "管理员用户名无效: $ADMIN_USER"
+    [[ "$LISTEN" =~ ^(\[[0-9A-Fa-f:]+\]|[A-Za-z0-9._-]+):([0-9]{1,5})$ ]] || die "监听地址格式无效: $LISTEN"
+    port="${BASH_REMATCH[2]}"
+    ((10#$port >= 1 && 10#$port <= 65535)) || die "监听端口超出范围: $port"
+    [[ "$ORIGINS" != ,* && "$ORIGINS" != *, && "$ORIGINS" != *,,* ]] || die "Origin 列表中存在空项"
+    local old_ifs="$IFS"
+    IFS=',' read -r -a origin_items <<<"$ORIGINS"
+    IFS="$old_ifs"
+    ((${#origin_items[@]} > 0)) || die "Origin 列表不能为空"
+    for origin in "${origin_items[@]}"; do
+        [[ "$origin" =~ ^https?://(\[[0-9A-Fa-f:]+\]|[A-Za-z0-9._-]+)(:([0-9]{1,5}))?$ ]] \
+            || die "Origin 格式无效: $origin"
+        origin_host="${BASH_REMATCH[1]}"
+        origin_port="${BASH_REMATCH[3]:-}"
+        [[ -n "$origin_host" ]] || die "Origin 主机不能为空"
+        if [[ -n "$origin_port" ]]; then
+            ((10#$origin_port >= 1 && 10#$origin_port <= 65535)) || die "Origin 端口超出范围: $origin_port"
         fi
+    done
+    [[ "$AVAHI_CONFIG_DIR" =~ ^/[A-Za-z0-9._/+:-]+$ && "$AVAHI_CONFIG_DIR" != *"/../"* && "$AVAHI_CONFIG_DIR" != *"/.." ]] \
+        || die "Avahi 配置目录必须是安全的绝对路径"
+}
+
+elevate_if_needed() {
+    [[ "$(id -u)" -eq 0 ]] && return 0
+    command -v sudo >/dev/null 2>&1 || die "需要 root 权限，但系统中找不到 sudo；请以 root 运行本脚本"
+    say "需要系统管理员权限，正在调用 sudo…"
+    exec sudo -- "$SCRIPT_PATH" "${ORIGINAL_ARGS[@]}"
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "缺少必需命令: $1"
+}
+
+assert_managed_dir() {
+    [[ ! -L "$1" ]] || die "拒绝使用符号链接目录: $1"
+}
+
+assert_managed_file() {
+    [[ ! -L "$1" ]] || die "拒绝覆盖符号链接文件: $1"
+}
+
+create_service_account() {
+    local previous_created
+    previous_created="$(state_get CREATED_USER)"
+    if getent passwd "$SERVICE_USER" >/dev/null 2>&1; then
+        [[ "$(id -u "$SERVICE_USER")" -ne 0 ]] || die "服务账户不能是 root"
+        CREATED_USER="${previous_created:-0}"
+        say "服务账户已存在: $SERVICE_USER"
         return
     fi
-    if [[ -f "/etc/avahi-manager/manager.toml" ]]; then
-        CONFIG_FILE="/etc/avahi-manager/manager.toml"
-    elif [[ -f "$PACKAGING_DIR/manager.toml" ]]; then
-        CONFIG_FILE="$PACKAGING_DIR/manager.toml"
-    else
-        echo "错误: 找不到 manager.toml (传入 -c 或放入 /etc/avahi-manager/)" >&2
-        exit 1
-    fi
+
+    local nologin_shell
+    nologin_shell="$(command -v nologin || true)"
+    [[ -n "$nologin_shell" ]] || nologin_shell="/usr/sbin/nologin"
+    useradd --system --user-group --no-create-home \
+        --home-dir "$DATABASE_DIR" --shell "$nologin_shell" "$SERVICE_USER"
+    CREATED_USER=1
+    say "已创建不可登录的系统账户: $SERVICE_USER"
 }
 
-if [[ "$UNINSTALL" -eq 0 ]]; then
-    ensure_config
+render_files() {
+    local service_group="$1" journal_line=""
+    if getent group systemd-journal >/dev/null 2>&1; then
+        journal_line="SupplementaryGroups=systemd-journal"
+    fi
 
-    USER="$(toml_get "$CONFIG_FILE" user)";               USER="${USER:-avahi-manager}"
-    BINARY_PATH="$(toml_get "$CONFIG_FILE" binary_path)"; BINARY_PATH="${BINARY_PATH:-$DEFAULT_BINARY}"
-    AVAHI_CONFIG_DIR="$(toml_get "$CONFIG_FILE" avahi_config_dir)"; AVAHI_CONFIG_DIR="${AVAHI_CONFIG_DIR:-/etc/avahi}"
-    DATABASE_PATH="$(toml_get "$CONFIG_FILE" database_path)"; DATABASE_PATH="${DATABASE_PATH:-/var/lib/avahi-manager/manager.db}"
-    DEFAULT_BACKUPS="/var/lib/avahi-manager-helper/backups"
-    BACKUPS_DIR="$(toml_get "$CONFIG_FILE" backups_dir)";  BACKUPS_DIR="${BACKUPS_DIR:-$DEFAULT_BACKUPS}"
-    DEFAULT_SOCKET="/run/avahi-manager/helper.sock"
-    SOCKET_PATH="$(toml_get "$CONFIG_FILE" socket_path)";  SOCKET_PATH="${SOCKET_PATH:-$DEFAULT_SOCKET}"
-    LISTEN="$(toml_get "$CONFIG_FILE" listen)";            LISTEN="${LISTEN:-127.0.0.1:8053}"
-    ORIGINS_JSON="$(toml_get "$CONFIG_FILE" origins)";     ORIGINS="${ORIGINS_JSON:-http://127.0.0.1:8053}"
+    cat >"$WORK_DIR/$SERVICE" <<EOF
+[Unit]
+Description=Avahi Manager web interface
+After=network.target dbus.service $HELPER_SOCKET
+Wants=$HELPER_SOCKET
 
-    DB_DIR="$(dirname "$DATABASE_PATH")"
-else
-    # 卸载模式不要求配置存在。
-    true
-fi
+[Service]
+Type=exec
+User=$SERVICE_USER
+Group=$service_group
+$journal_line
+ExecStart=$BINARY_PATH serve --database $DATABASE_PATH --config-dir $AVAHI_CONFIG_DIR --helper $SOCKET_PATH --origins $ORIGINS --listen $LISTEN
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=$DATABASE_DIR $RUNTIME_DIR
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
 
-# ---- 权限检查（安装模式） ---------------------------------------------------
-if [[ "$UNINSTALL" -eq 0 && "$(id -u)" -ne 0 ]]; then
-    echo "安装需要 root 权限，请以 sudo 运行。" >&2
-    exit 1
-fi
+[Install]
+WantedBy=multi-user.target
+EOF
 
-# ---- 打印将要做的事 ---------------------------------------------------------
-announce() {
-    echo
-    echo "=============================================="
-    echo " Avahi Manager 安装"
-    echo "=============================================="
-    echo "  服务账户       : $USER"
-    echo "  二进制          : $BINARY_PATH"
-    echo "  Avahi 配置目录 : $AVAHI_CONFIG_DIR"
-    echo "  数据库          : $DATABASE_PATH"
-    echo "  备份目录        : $BACKUPS_DIR"
-    echo "  socket          : $SOCKET_PATH"
-    echo "  HTTP            : $LISTEN  (Origin: $ORIGINS)"
-    echo "=============================================="
+    cat >"$WORK_DIR/$HELPER_SERVICE" <<EOF
+[Unit]
+Description=Avahi Manager privileged helper
+Requires=$HELPER_SOCKET
+After=$HELPER_SOCKET dbus.service
+PartOf=$SERVICE
+Before=$SERVICE
+
+[Service]
+Type=exec
+User=root
+Group=root
+ExecStart=$BINARY_PATH helper --manager-user $SERVICE_USER --config-dir $AVAHI_CONFIG_DIR --backups $BACKUPS_DIR --socket $SOCKET_PATH
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=$AVAHI_CONFIG_DIR $BACKUP_ROOT /etc/systemd/system $RUNTIME_DIR
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+EOF
+
+    cat >"$WORK_DIR/$HELPER_SOCKET" <<EOF
+[Unit]
+Description=Avahi Manager privileged helper socket
+PartOf=$SERVICE
+Before=$SERVICE
+
+[Socket]
+ListenStream=$SOCKET_PATH
+SocketUser=root
+SocketGroup=$service_group
+SocketMode=0660
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target
+EOF
+
+    cat >"$WORK_DIR/manager.toml" <<EOF
+# Generated by install.sh. Reinstall with the corresponding option to edit.
+user = "$SERVICE_USER"
+binary_path = "$BINARY_PATH"
+avahi_config_dir = "$AVAHI_CONFIG_DIR"
+database_path = "$DATABASE_PATH"
+backups_dir = "$BACKUPS_DIR"
+socket_path = "$SOCKET_PATH"
+listen = "$LISTEN"
+origins = ["${ORIGINS//,/\", \"}"]
+EOF
+
+    cat >"$WORK_DIR/tmpfiles.conf" <<EOF
+d $RUNTIME_DIR 0750 root $service_group -
+EOF
 }
 
-# ---- 安装逻辑 ---------------------------------------------------------------
-do_install() {
-    announce
+install_manager() {
+    validate_options
+    elevate_if_needed
 
-    # 1) 校验 Avahi 已就绪（配置事实来源必须存在）。
-    if [[ ! -d "$AVAHI_CONFIG_DIR" ]]; then
-        echo "错误: 配置目录 $AVAHI_CONFIG_DIR 不存在。" >&2
-        echo "请先安装 Avahi: sudo apt install avahi-daemon" >&2
-        exit 1
+    # state_get may have been unable to traverse the root-only state directory
+    # before sudo. Re-read it after elevation.
+    INSTALLED_SERVICE_USER="$(state_get SERVICE_USER)"
+    if [[ "$SERVICE_USER_EXPLICIT" -eq 0 && -n "$INSTALLED_SERVICE_USER" ]]; then
+        SERVICE_USER="$INSTALLED_SERVICE_USER"
+    elif [[ -n "$INSTALLED_SERVICE_USER" && "$SERVICE_USER" != "$INSTALLED_SERVICE_USER" ]]; then
+        die "已安装实例使用账户 $INSTALLED_SERVICE_USER；更换账户前请先使用 uninstall --purge"
     fi
+    validate_options
 
-    # 2) 决定二进制来源。
-    local bin_src
-    if [[ -n "$BIN_PATH_ARG" ]]; then
-        bin_src="$BIN_PATH_ARG"
-    elif [[ -f "$PACKAGING_DIR/../bin/avahi-manager" ]]; then
-        bin_src="$PACKAGING_DIR/../bin/avahi-manager"
-    else
-        echo "错误: 未找到二进制。请用 -b 指定，或先执行 make check。" >&2
-        exit 1
+    for command_name in awk getent id install mktemp runuser systemctl systemd-tmpfiles useradd; do
+        require_command "$command_name"
+    done
+    [[ -d /run/systemd/system ]] || die "systemd 未作为当前系统的 init 运行"
+    [[ -x /usr/sbin/avahi-daemon ]] || die "找不到 /usr/sbin/avahi-daemon；请先安装 avahi-daemon"
+    [[ -x /usr/bin/journalctl ]] || die "找不到 /usr/bin/journalctl；日志功能需要完整的 systemd 工具"
+    [[ -d "$AVAHI_CONFIG_DIR" ]] || die "找不到 $AVAHI_CONFIG_DIR；请先安装并配置 avahi-daemon"
+    systemctl cat avahi-daemon.service avahi-daemon.socket >/dev/null 2>&1 \
+        || die "找不到 avahi-daemon.service 或 avahi-daemon.socket"
+    [[ -f "$SOURCE_BINARY" && -x "$SOURCE_BINARY" ]] \
+        || die "请把可执行文件 avahi-manager 与 install.sh 放在同一目录"
+
+    for managed_dir in "$CONFIG_DIR" "$DATABASE_DIR" "$BACKUP_ROOT" "$BACKUPS_DIR" "$RUNTIME_DIR"; do
+        assert_managed_dir "$managed_dir"
+    done
+    for managed_file in "$BINARY_PATH" "$CONFIG_FILE" "$INSTALL_STATE" \
+        "$SYSTEMD_DIR/$SERVICE" "$SYSTEMD_DIR/$HELPER_SERVICE" \
+        "$SYSTEMD_DIR/$HELPER_SOCKET" "$TMPFILES_FILE"; do
+        assert_managed_file "$managed_file"
+    done
+
+    create_service_account
+    local service_group
+    service_group="$(id -gn "$SERVICE_USER")"
+
+    WORK_DIR="$(mktemp -d)"
+    trap 'rm -rf -- "$WORK_DIR"' EXIT
+    render_files "$service_group"
+
+    # Stop old processes before replacing their executable. Missing units are
+    # expected on a first installation.
+    systemctl stop "$SERVICE" "$HELPER_SOCKET" "$HELPER_SERVICE" 2>/dev/null || true
+
+    install -d -o root -g root -m 0755 "$(dirname "$BINARY_PATH")" "$CONFIG_DIR"
+    if [[ ! "$SOURCE_BINARY" -ef "$BINARY_PATH" ]]; then
+        install -o root -g root -m 0755 "$SOURCE_BINARY" "$BINARY_PATH"
     fi
-    if [[ ! -x "$bin_src" ]]; then
-        echo "错误: $bin_src 不可执行。" >&2
-        exit 1
+    install -d -o "$SERVICE_USER" -g "$service_group" -m 0700 "$DATABASE_DIR"
+    chown -R "$SERVICE_USER:$service_group" "$DATABASE_DIR"
+    chmod 0700 "$DATABASE_DIR"
+    install -d -o root -g root -m 0700 "$BACKUP_ROOT" "$BACKUPS_DIR"
+    chown -R root:root "$BACKUP_ROOT"
+    chmod 0700 "$BACKUP_ROOT" "$BACKUPS_DIR"
+
+    install -o root -g root -m 0644 "$WORK_DIR/$SERVICE" "$SYSTEMD_DIR/$SERVICE"
+    install -o root -g root -m 0644 "$WORK_DIR/$HELPER_SERVICE" "$SYSTEMD_DIR/$HELPER_SERVICE"
+    install -o root -g root -m 0644 "$WORK_DIR/$HELPER_SOCKET" "$SYSTEMD_DIR/$HELPER_SOCKET"
+    install -o root -g root -m 0644 "$WORK_DIR/tmpfiles.conf" "$TMPFILES_FILE"
+    install -o root -g root -m 0644 "$WORK_DIR/manager.toml" "$CONFIG_FILE"
+    cat >"$INSTALL_STATE" <<EOF
+SERVICE_USER=$SERVICE_USER
+SERVICE_GROUP=$service_group
+CREATED_USER=$CREATED_USER
+EOF
+    chmod 0600 "$INSTALL_STATE"
+
+    systemd-tmpfiles --create "$TMPFILES_FILE"
+    if command -v systemd-analyze >/dev/null 2>&1; then
+        systemd-analyze verify \
+            "$SYSTEMD_DIR/$SERVICE" \
+            "$SYSTEMD_DIR/$HELPER_SERVICE" \
+            "$SYSTEMD_DIR/$HELPER_SOCKET" >/dev/null
     fi
-
-    # 3) 不覆盖已有部署（除非显式卸载）。
-    if getent passwd "$USER" >/dev/null 2>&1 && [[ -e "$BINARY_PATH" ]]; then
-        echo "检测到已存在部署（账户 $USER 和 $BINARY_PATH）。" >&2
-        echo "如需重新安装，请先执行: sudo $0 -u" >&2
-        exit 1
-    fi
-
-    # 4) 创建系统账户（仅当不存在）。
-    if ! getent passwd "$USER" >/dev/null 2>&1; then
-        useradd --system --user-group --no-create-home \
-            --home-dir "$DB_DIR" \
-            --shell /usr/sbin/nologin "$USER"
-        echo "  已创建系统账户: $USER"
-    else
-        echo "  账户 $USER 已存在，跳过创建。"
-    fi
-
-    # 5) 安装二进制。
-    install -d -o root -g root -m 0755 "$(dirname "$BINARY_PATH")"
-    install -o root -g root -m 0755 "$bin_src" "$BINARY_PATH"
-    echo "  已安装二进制: $BINARY_PATH"
-
-    # 6) 创建数据目录。
-    install -d -o "$USER" -g "$USER" -m 0700 "$DB_DIR"
-    install -d -o root  -g root  -m 0700 "$(dirname "$BACKUPS_DIR")"
-    install -d -o root  -g root  -m 0700 "$BACKUPS_DIR"
-    mkdir -p /run/avahi-manager && chown root:"$USER" /run/avahi-manager && chmod 0750 /run/avahi-manager
-    echo "  已创建数据目录，权限符合非 root Web + root Helper 隔离要求。"
-
-    # 7) 保留配置副本。
-    install -d -o root -g root -m 0755 /etc/avahi-manager
-    install -o root -g root -m 0644 "$CONFIG_FILE" /etc/avahi-manager/manager.toml
-
-    # 8) 渲染 systemd 单元。
-    render()
-    {
-        sed -e "s|@@USER@@|$USER|g" \
-            -e "s|@@BINARY_PATH@@|$BINARY_PATH|g" \
-            -e "s|@@AVAHI_CONFIG_DIR@@|$AVAHI_CONFIG_DIR|g" \
-            -e "s|@@DATABASE_PATH@@|$DATABASE_PATH|g" \
-            -e "s|@@DATABASE_DIR@@|$DB_DIR|g" \
-            -e "s|@@BACKUPS_DIR@@|$BACKUPS_DIR|g" \
-            -e "s|@@SOCKET_PATH@@|$SOCKET_PATH|g" \
-            -e "s|@@LISTEN@@|$LISTEN|g" \
-            -e "s|@@ORIGINS@@|$ORIGINS|g" \
-            "$1"
-    }
-
-    install -o root -g root -m 0644 <(render "$UNIT_SRC/$TARGET_NAME.service") "$SYSTEMD_DIR/$TARGET_NAME.service"
-    install -o root -g root -m 0644 <(render "$UNIT_SRC/$HELPER_NAME.service") "$SYSTEMD_DIR/$HELPER_NAME.service"
-    install -o root -g root -m 0644 <(render "$UNIT_SRC/$HELPER_NAME.socket") "$SYSTEMD_DIR/$HELPER_NAME.socket"
-    echo "  已生成 systemd 单元: $TARGET_NAME{, -helper.service, -helper.socket}"
-
     systemctl daemon-reload
 
-    # 9) 首次运行需要引导管理员密码（无默认密码）。
-    runuser -u "$USER" -- "$BINARY_PATH" init-admin --database "$DATABASE_PATH" \
-        || { echo "注意: 管理员可能已存在；若未设置请手动运行 init-admin。" >&2; }
+    say "正在初始化网页登录管理员（已有管理员时会自动跳过）…"
+    runuser -u "$SERVICE_USER" -- "$BINARY_PATH" init-admin \
+        --if-missing --database "$DATABASE_PATH" --username "$ADMIN_USER"
 
-    # 10) 启用并启动（helper 由 socket 按需拉起）。
-    systemctl enable --now "$HELPER_NAME.socket"
-    systemctl enable --now "$TARGET_NAME.service"
+    systemctl enable --now "$HELPER_SOCKET"
+    systemctl enable --now "$SERVICE"
 
-    echo
-    echo "已启动。请访问: http://${LISTEN}"
-    echo
-    echo "  查看状态: systemctl status $TARGET_NAME $HELPER_NAME.socket"
-    echo "  查看日志: journalctl -u $TARGET_NAME -f"
-    echo
+    say ""
+    say "Avahi Manager 已安装并启动。"
+    say "访问地址: http://$LISTEN"
+    say "查看状态: $SCRIPT_PATH status"
+    say "查看日志: sudo journalctl -u $SERVICE -f"
+    say "卸载程序: $SCRIPT_PATH uninstall"
 }
 
-do_uninstall() {
-    if [[ "$(id -u)" -ne 0 ]]; then
-        echo "卸载需要 root 权限。" >&2
-        exit 1
+show_status() {
+    say "二进制: $BINARY_PATH"
+    if [[ -x "$BINARY_PATH" ]]; then say "安装状态: 已安装"; else say "安装状态: 未安装"; fi
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --no-pager --full status "$SERVICE" "$HELPER_SOCKET" 2>/dev/null || true
     fi
-    echo "正在停止并移除 Avahi Manager 服务..."
-    systemctl disable --now "$TARGET_NAME.service" 2>/dev/null || true
-    systemctl disable --now "$HELPER_NAME.socket"   2>/dev/null || true
-    systemctl disable --now "$HELPER_NAME.service"  2>/dev/null || true
-    rm -f "$SYSTEMD_DIR/$TARGET_NAME.service" \
-          "$SYSTEMD_DIR/$HELPER_NAME.service" \
-          "$SYSTEMD_DIR/$HELPER_NAME.socket"
-    systemctl daemon-reload
-    echo
-    echo "systemd 单元已移除。数据未删除，如需清除请手动删除："
-    echo "  - 数据库:     /var/lib/avahi-manager/"
-    echo "  - 备份目录:   /var/lib/avahi-manager-helper/"
-    echo "  - 账户:       userdel avahi-manager"
-    echo
 }
 
-if [[ "$UNINSTALL" -eq 1 ]]; then
-    do_uninstall
-else
-    do_install
-fi
+manage_service() {
+    elevate_if_needed
+    require_command systemctl
+    [[ -f "$SYSTEMD_DIR/$SERVICE" ]] || die "Avahi Manager 尚未安装"
+    case "$ACTION" in
+        start)
+            require_command systemd-tmpfiles
+            systemd-tmpfiles --create "$TMPFILES_FILE"
+            systemctl start "$HELPER_SOCKET" "$SERVICE"
+            ;;
+        stop) systemctl stop "$SERVICE" ;;
+        restart)
+            require_command systemd-tmpfiles
+            systemd-tmpfiles --create "$TMPFILES_FILE"
+            systemctl restart "$HELPER_SOCKET" "$SERVICE"
+            ;;
+    esac
+    systemctl --no-pager --full status "$SERVICE" "$HELPER_SOCKET" || true
+}
+
+show_logs() {
+    elevate_if_needed
+    require_command journalctl
+    journalctl --unit "$SERVICE" --unit "$HELPER_SERVICE" --follow
+}
+
+uninstall_manager() {
+    elevate_if_needed
+    require_command systemctl
+
+    local created_user installed_user
+    created_user="$(state_get CREATED_USER)"
+    installed_user="$(state_get SERVICE_USER)"
+    installed_user="${installed_user:-$SERVICE_USER}"
+    if [[ "$PURGE" -eq 1 && "$created_user" == "1" ]]; then
+        require_command userdel
+    fi
+
+    systemctl disable --now "$SERVICE" "$HELPER_SOCKET" "$HELPER_SERVICE" 2>/dev/null || true
+    rm -f -- \
+        "$SYSTEMD_DIR/$SERVICE" \
+        "$SYSTEMD_DIR/$HELPER_SERVICE" \
+        "$SYSTEMD_DIR/$HELPER_SOCKET" \
+        "$TMPFILES_FILE" \
+        "$BINARY_PATH"
+    systemctl daemon-reload
+    systemctl reset-failed "$SERVICE" "$HELPER_SERVICE" 2>/dev/null || true
+    rm -f -- "$SOCKET_PATH"
+    rmdir -- "$RUNTIME_DIR" 2>/dev/null || true
+
+    if [[ "$PURGE" -eq 1 ]]; then
+        [[ "$DATABASE_DIR" == "/var/lib/avahi-manager" ]] || die "拒绝清理非预期数据库目录"
+        [[ "$BACKUP_ROOT" == "/var/lib/avahi-manager-helper" ]] || die "拒绝清理非预期备份目录"
+        if [[ "$created_user" == "1" ]] && getent passwd "$installed_user" >/dev/null 2>&1; then
+            userdel "$installed_user"
+            say "已删除脚本创建的系统账户: $installed_user"
+        fi
+        rm -rf -- "$DATABASE_DIR" "$BACKUP_ROOT" "$CONFIG_DIR"
+        say "Avahi Manager 已彻底卸载；数据库和备份已删除。"
+    else
+        rm -f -- "$CONFIG_FILE"
+        rmdir -- "$CONFIG_DIR" 2>/dev/null || true
+        say "Avahi Manager 已卸载。数据库和备份仍保留："
+        say "  $DATABASE_DIR"
+        say "  $BACKUP_ROOT"
+        if [[ "$created_user" == "1" ]]; then
+            say "服务账户 $installed_user 已保留，以保持数据文件的所有权；使用 --purge 可一并删除。"
+        fi
+    fi
+}
+
+case "$ACTION" in
+    install) install_manager ;;
+    status) show_status ;;
+    start|stop|restart) manage_service ;;
+    logs) show_logs ;;
+    uninstall) uninstall_manager ;;
+esac

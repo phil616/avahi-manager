@@ -35,8 +35,8 @@
 | 8 REST API | config/services/hosts/interfaces/status/discovery/logs/snapshots/audit/jobs/auth；认证强制、安全中间件、审计、SSE、集成测试 | updates 全接口；更严格的 JSON 重复键处理和全面边界测试 |
 | 9 React GUI | 八页导航、结构化编辑器、发现筛选/详情、日志、维护/备份/审计、认证、Vite/go:embed、桌面与移动浏览器验证 | 更新/安装 UI、接口有效策略、完整 diff、剩余字段及异常状态的浏览器验收、状态告警完整性 |
 | 10 运维 | journald 固定 argv 搜索/级别/时间/Follow、备份查看/恢复/删除和审计 UI | APT 确认/版本预览/snapshot/更新后检测、日志真实权限与 Follow 中断完整验证 |
-| 11 Helper | 同一程序 helper 入口、socket activation、SO_PEERCRED 双向校验、有限配置/服务/快照/生命周期 RPC、启动恢复、单写者、集成与拒绝测试 | APT 固定业务 RPC；缺少 Avahi 时的安装初始化路径；生产目录/socket/备份权限硬化与打包验收；真实隔离 systemd 写入验证 |
-| 12 部署 | Makefile、内嵌 UI、serve 非 root 检查、init-admin、默认本地监听与强制认证 | manager.toml、systemd service/helper/socket、Debian 包、安装卸载文档、权限硬化、真实系统端到端验收 |
+| 11 Helper | 同一程序 helper 入口、socket activation、SO_PEERCRED 双向校验、有限配置/服务/快照/生命周期 RPC、启动恢复、单写者、集成与拒绝测试、部署目录/socket/备份权限 | APT 固定业务 RPC；缺少 Avahi 时的安装初始化路径；真实隔离 systemd 写入验证 |
+| 12 部署 | Makefile、两文件发布目录、幂等安装/卸载脚本、自动 sudo/账户/权限/管理员初始化、manager.toml、systemd service/helper/socket、tmpfiles、默认本地监听与强制认证 | Debian 包、真实 Linux systemd 端到端验收 |
 
 ## V1 完整验收清单
 

@@ -1,8 +1,7 @@
 [Unit]
 Description=Avahi Manager privileged helper
-Documentation=https://github.com/anomalyco/opencode/issues
 Requires=avahi-manager-helper.socket
-After=avahi-manager-helper.socket
+After=avahi-manager-helper.socket dbus.service
 PartOf=avahi-manager.service
 Before=avahi-manager.service
 
@@ -21,10 +20,6 @@ ExecStart=@@BINARY_PATH@@ helper \
     --config-dir @@AVAHI_CONFIG_DIR@@ \
     --backups @@BACKUPS_DIR@@ \
     --socket @@SOCKET_PATH@@
-
-# Root-owned backup/state storage must never be writable by the web account.
-StateDirectory=avahi-manager-helper
-StateDirectoryMode=0700
 
 Restart=on-failure
 RestartSec=5s

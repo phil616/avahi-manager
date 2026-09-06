@@ -117,6 +117,7 @@ func runInitAdmin(args []string) error {
 	fs := flag.NewFlagSet("init-admin", flag.ContinueOnError)
 	dbPath := fs.String("database", "/var/lib/avahi-manager/manager.db", "manager SQLite database")
 	username := fs.String("username", "admin", "administrator username")
+	ifMissing := fs.Bool("if-missing", false, "succeed without prompting when an administrator already exists")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -139,6 +140,10 @@ func runInitAdmin(args []string) error {
 	if has, err := a.HasAdmin(ctx); err != nil {
 		return err
 	} else if has {
+		if *ifMissing {
+			fmt.Fprintln(os.Stdout, "Administrator already initialized.")
+			return nil
+		}
 		return fmt.Errorf("administrator already exists")
 	}
 	var raw []byte
